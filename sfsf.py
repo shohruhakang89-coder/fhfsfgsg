@@ -2,18 +2,18 @@
 # -*- coding: utf-8 -*-
 """
 ================================================================================
-ULTIMATE CLOUD NOTEBOOK v4.0 — PRO AI TRAINING & LIVE STUDIO EDITION
+ULTIMATE CLOUD NOTEBOOK v4.5 — VPS DAEMON & PRO AI STUDIO EDITION
 ================================================================================
-- 100% Complete Jupyter IOPub Protocol: stream, display_data, update_display_data
-  (with transient display_id for live HTML dashboards like OQIM-KOKORO StudioUI),
-  execute_result, error, clear_output(wait=True).
-- Zero-Freeze Stream & DOM Engine: Monotonic _rev versioning prevents frozen
-  logs or skipped HTML/Plot/Audio updates.
-- High-Speed In-Memory Output Cache + Throttled SQLite Persistence: Handles
-  heavy base64 WAV + Spectrogram updates without choking WebSocket or DB.
-- Full Audio Studio & Checkpoint Explorer: Scans /kaggle/working, workspace,
-  and /temp (including /temp/oqim_kokoro_v7_work).
-- Persistent Background Execution + Auto Cloudflare HTTPS Tunnel.
+- Auto-Healing Environment: Fixes Conda/Pip `typing_extensions.Sentinel` and
+  `pyarrow` vs `NumPy 1.26.4 / 2.x` ABI mismatches automatically at boot.
+- True 24/7 VPS Background Daemon: Running `python sfsf.py` on a VPS detaches
+  the server, IPython Kernel, and Cloudflare Tunnel into an immortal session.
+  Pressing Ctrl+C or closing SSH NEVER kills the kernel or active training.
+- Hybrid WebSocket + GZip HTTP Delta Sync (`/api/poll`): Guarantees 100% of
+  large outputs (OQIM-KOKORO StudioUI base64 WAVs, PNG spectrograms, tqdm logs)
+  render even over unstable Cloudflare Quick Tunnels.
+- Full Jupyter IOPub Protocol: `stream`, `display_data`, `update_display_data`
+  (with `display_id`), `execute_result`, `error`, `clear_output(wait=True)`.
 ================================================================================
 """
 
@@ -23,16 +23,14 @@ import time
 import json
 import uuid
 import glob
-import math
 import queue
 import shutil
 import signal
 import base64
+import socket
 import secrets
 import sqlite3
 import logging
-import hashlib
-import tarfile
 import asyncio
 import platform
 import threading
@@ -40,17 +38,51 @@ import traceback
 import subprocess
 import urllib.request
 from pathlib import Path
-from datetime import datetime, timezone
+from contextlib import asynccontextmanager
 from typing import Dict, List, Optional, Any, Tuple
 
+# Silence root pip warnings and noisy deprecation logs globally
+os.environ["PIP_ROOT_USER_ACTION"] = "ignore"
+os.environ["PIP_DISABLE_PIP_VERSION_CHECK"] = "1"
+os.environ["PYTHONWARNINGS"] = "ignore::DeprecationWarning"
+
 
 # ==============================================================================
-# 1. BOOTSTRAP: AUTO-INSTALL DEPENDENCIES & CLOUDFLARED
+# 1. AUTO-HEALING BOOTSTRAP (FIXES CONDA/VPS PIP CONFLICTS AUTOMATICALLY)
 # ==============================================================================
+def _run_pip(args: List[str]) -> bool:
+    cmd = [
+        sys.executable,
+        "-m",
+        "pip",
+        "install",
+        "-q",
+        "--disable-pip-version-check",
+        "--root-user-action=ignore",
+    ] + args
+    try:
+        subprocess.check_call(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        return True
+    except Exception:
+        try:
+            subprocess.check_call([sys.executable, "-m", "pip", "install", "-q"] + args)
+            return True
+        except Exception:
+            return False
+
+
 def bootstrap_environment():
+    # 1. Fix broken typing_extensions (ImportError: cannot import name 'Sentinel')
+    try:
+        from typing_extensions import Sentinel  # noqa: F401
+    except Exception:
+        print("[Bootstrap] Updating typing_extensions for Pydantic compatibility...", flush=True)
+        _run_pip(["--upgrade", "typing_extensions>=4.12.2"])
+
+    # 2. Check and install core web/kernel packages without breaking existing setup
     required_pkgs = [
         ("fastapi", "fastapi"),
-        ("uvicorn", "uvicorn[standard]"),
+        ("uvicorn", "uvicorn"),
         ("websockets", "websockets"),
         ("jupyter_client", "jupyter_client"),
         ("ipykernel", "ipykernel"),
@@ -66,14 +98,32 @@ def bootstrap_environment():
     for mod_name, pip_name in required_pkgs:
         try:
             __import__(mod_name)
-        except ImportError:
+        except Exception:
             missing.append(pip_name)
 
     if missing:
-        print(f"[Bootstrap] Installing packages: {', '.join(missing)} ...")
-        subprocess.check_call(
-            [sys.executable, "-m", "pip", "install", "-q", "--upgrade"] + missing
-        )
+        print(f"[Bootstrap] Installing missing packages: {', '.join(missing)} ...", flush=True)
+        _run_pip(missing)
+
+    # 3. Verify pydantic_core + fastapi import cleanly; heal if broken
+    try:
+        import pydantic  # noqa: F401
+        import fastapi  # noqa: F401
+    except Exception:
+        print("[Bootstrap] Repairing typing_extensions / pydantic / fastapi...", flush=True)
+        _run_pip(["--upgrade", "typing_extensions>=4.12.2", "pydantic>=2.7.0", "fastapi", "uvicorn"])
+
+    # 4. Auto-heal Conda PyArrow vs NumPy 1.26.4 ABI conflict
+    # ("ImportError: pyarrow requires NumPy 2.0 or newer, found 1.26.4")
+    test_pyarrow = subprocess.run(
+        [sys.executable, "-c", "import numpy, pyarrow.parquet"],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    if test_pyarrow.returncode != 0 and "pyarrow" in test_pyarrow.stderr.lower():
+        print("[Bootstrap] Detected PyArrow / NumPy ABI conflict. Auto-healing pyarrow...", flush=True)
+        _run_pip(["--force-reinstall", "--no-deps", "pyarrow==17.0.0"])
 
 
 bootstrap_environment()
@@ -92,7 +142,8 @@ from fastapi import (
     UploadFile,
     File,
 )
-from fastapi.responses import HTMLResponse, JSONResponse, FileResponse, Response
+from fastapi.middleware.gzip import GZipMiddleware
+from fastapi.responses import HTMLResponse, JSONResponse, FileResponse
 from pydantic import BaseModel
 
 
@@ -109,15 +160,27 @@ LOGS_DIR = APP_DIR / "logs"
 DB_PATH = APP_DIR / "notebook_state.db"
 TOKEN_FILE = APP_DIR / "auth_token.txt"
 TUNNEL_URL_FILE = APP_DIR / "tunnel_url.txt"
+DAEMON_PID_FILE = APP_DIR / "daemon.pid"
 AUTOSAVE_IPYNB = WORKSPACE_DIR / "autosave_notebook.ipynb"
 TRAINING_CONFIG_FILE = WORKSPACE_DIR / "training_config.json"
 
-for d in [APP_DIR, WORKSPACE_DIR, CHECKPOINTS_DIR, AUDIO_OUT_DIR, LOGS_DIR]:
-    d.mkdir(parents=True, exist_ok=True)
+for _d in [APP_DIR, WORKSPACE_DIR, CHECKPOINTS_DIR, AUDIO_OUT_DIR, LOGS_DIR]:
+    _d.mkdir(parents=True, exist_ok=True)
 
 SERVER_HOST = os.environ.get("UCN_HOST", "127.0.0.1")
 SERVER_PORT = int(os.environ.get("UCN_PORT", "8765"))
 BOOT_TIME = time.time()
+
+
+def is_running_in_notebook() -> bool:
+    try:
+        from IPython import get_ipython
+        ip = get_ipython()
+        if ip is None:
+            return False
+        return "IPKernelApp" in ip.config or hasattr(ip, "kernel")
+    except Exception:
+        return False
 
 
 def get_or_create_token() -> str:
@@ -174,11 +237,10 @@ import os
 import json
 import glob
 import wave
-import struct
 from pathlib import Path
-from typing import Optional, Dict, Any, Union
+from typing import Optional, Dict, Any, Tuple
 import numpy as np
-from IPython.display import Audio, display, HTML
+from IPython.display import display, HTML
 
 WORKSPACE_DIR = Path(__file__).resolve().parent
 CHECKPOINTS_DIR = WORKSPACE_DIR / "checkpoints"
@@ -211,13 +273,9 @@ def _to_numpy_audio(data: Any) -> np.ndarray:
     return np.clip(arr, -1.0, 1.0)
 
 
-def save_wav(
-    data: Any,
-    sample_rate: int = 24000,
-    filename: Optional[str] = None
-) -> str:
+def save_wav(data: Any, sample_rate: int = 24000, filename: Optional[str] = None) -> str:
     arr = _to_numpy_audio(data)
-    channels, frames = arr.shape
+    channels, _ = arr.shape
     pcm16 = (arr.T * 32767.0).astype(np.int16)
     if not filename:
         import time
@@ -237,7 +295,7 @@ def play_audio(
     sample_rate: int = 24000,
     label: str = "Generated Audio",
     save_copy: bool = True,
-    filename: Optional[str] = None
+    filename: Optional[str] = None,
 ):
     if isinstance(data, (str, Path)) and os.path.exists(str(data)):
         wav_path = str(data)
@@ -331,7 +389,13 @@ class PersistentStateDB:
     def __init__(self, db_path: Path):
         self.db_path = db_path
         self._lock = threading.RLock()
+        self.global_rev = 1
         self._init_db()
+
+    def bump_rev(self) -> int:
+        with self._lock:
+            self.global_rev += 1
+            return self.global_rev
 
     def _connect(self) -> sqlite3.Connection:
         conn = sqlite3.connect(str(self.db_path), timeout=30.0, check_same_thread=False)
@@ -358,14 +422,6 @@ class PersistentStateDB:
                 )
                 """
             )
-            conn.execute(
-                """
-                CREATE TABLE IF NOT EXISTS metadata (
-                    key TEXT PRIMARY KEY,
-                    value TEXT NOT NULL
-                )
-                """
-            )
             conn.commit()
             cur = conn.execute("SELECT COUNT(*) AS cnt FROM cells")
             if cur.fetchone()["cnt"] == 0:
@@ -374,18 +430,17 @@ class PersistentStateDB:
     def _seed_default_cells(self, conn: sqlite3.Connection):
         now = time.time()
         welcome_md = (
-            "### ⚡ Ultimate Cloud Notebook v4.0 — Pro AI & Audio Studio\n"
-            "- **Persistent Execution**: Brauzerni yopsangiz ham kod va AI training orqa fonda to'xtovsiz ishlaydi.\n"
-            "- **Full Display Support**: `OQIM-KOKORO StudioUI` (`display_id` / `update_display`), `tqdm`, `Matplotlib`, `Audio` va `Image` to'liq real-time ko'rsatiladi.\n"
-            "- **Shortcuts**: `Shift + Enter` (Run & Next), `Ctrl + Enter` (Run in-place)."
+            "### ⚡ Ultimate Cloud Notebook v4.5 — Pro VPS & AI Training Studio\n"
+            "- **24/7 Immortal Runtime**: Brauzerni yoki SSH terminalni yopsangiz ham mashg'ulot (`training`) to'xtamaydi.\n"
+            "- **Full Live Output**: `OQIM-KOKORO StudioUI` (`display_id` / `update_display`), `tqdm`, `Audio`, `Spectrogram` va `Matplotlib` grafiklar uzilishsiz ko'rsatiladi."
         )
         sample_code = (
-            "import torch, platform, ucloud\n"
-            "import numpy as np\n\n"
-            "print(f'Python: {platform.python_version()} | PyTorch: {torch.__version__} | CUDA: {torch.cuda.is_available()}')\n"
+            "import torch, platform, numpy as np, pyarrow as pa, ucloud\n"
+            "print(f'Python: {platform.python_version()} | PyTorch: {torch.__version__} | NumPy: {np.__version__} | PyArrow: {pa.__version__}')\n"
+            "print(f'CUDA Available: {torch.cuda.is_available()} | Device Count: {torch.cuda.device_count()}')\n"
             "if torch.cuda.is_available():\n"
             "    for i in range(torch.cuda.device_count()):\n"
-            "        print(f'GPU {i}: {torch.cuda.get_device_name(i)}')\n"
+            "        print(f'  -> GPU {i}: {torch.cuda.get_device_name(i)}')\n"
         )
         cells = [
             (uuid.uuid4().hex[:12], "markdown", welcome_md, "idle", None, "[]", None, None, 0, now),
@@ -428,12 +483,7 @@ class PersistentStateDB:
             r = conn.execute("SELECT * FROM cells WHERE id = ?", (cell_id,)).fetchone()
             return self._row_to_dict(r) if r else None
 
-    def create_cell(
-        self,
-        cell_type: str = "code",
-        source: str = "",
-        after_id: Optional[str] = None,
-    ) -> Dict[str, Any]:
+    def create_cell(self, cell_type: str = "code", source: str = "", after_id: Optional[str] = None) -> Dict[str, Any]:
         with self._lock, self._connect() as conn:
             rows = conn.execute("SELECT id, position FROM cells ORDER BY position ASC").fetchall()
             insert_pos = len(rows)
@@ -454,6 +504,7 @@ class PersistentStateDB:
                 (cid, cell_type, source, insert_pos, now),
             )
             conn.commit()
+            self.bump_rev()
         self.export_to_ipynb(AUTOSAVE_IPYNB)
         return self.get_cell(cid)
 
@@ -487,6 +538,7 @@ class PersistentStateDB:
         with self._lock, self._connect() as conn:
             conn.execute(f"UPDATE cells SET {', '.join(sets)} WHERE id = ?", vals)
             conn.commit()
+            self.bump_rev()
         return self.get_cell(cell_id)
 
     def delete_cell(self, cell_id: str) -> bool:
@@ -501,6 +553,7 @@ class PersistentStateDB:
             if len(rows) == 0:
                 self._seed_default_cells(conn)
             conn.commit()
+            self.bump_rev()
         self.export_to_ipynb(AUTOSAVE_IPYNB)
         return True
 
@@ -517,6 +570,7 @@ class PersistentStateDB:
                 for pos, cid in enumerate(ids):
                     conn.execute("UPDATE cells SET position = ? WHERE id = ?", (pos, cid))
                 conn.commit()
+                self.bump_rev()
         self.export_to_ipynb(AUTOSAVE_IPYNB)
         return self.list_cells()
 
@@ -524,6 +578,7 @@ class PersistentStateDB:
         with self._lock, self._connect() as conn:
             conn.execute("UPDATE cells SET outputs_json = '[]', updated_at = ?", (time.time(),))
             conn.commit()
+            self.bump_rev()
         self.export_to_ipynb(AUTOSAVE_IPYNB)
         return self.list_cells()
 
@@ -536,10 +591,7 @@ class PersistentStateDB:
                 if c["cell_type"] == "markdown":
                     nb_cells.append(new_markdown_cell(source=c["source"]))
                 else:
-                    nc = new_code_cell(
-                        source=c["source"],
-                        execution_count=c["execution_count"],
-                    )
+                    nc = new_code_cell(source=c["source"], execution_count=c["execution_count"])
                     nb_outs = []
                     for out in c.get("outputs", []):
                         otype = out.get("output_type")
@@ -627,15 +679,13 @@ class PersistentStateDB:
             else:
                 self._seed_default_cells(conn)
             conn.commit()
+            self.bump_rev()
         self.export_to_ipynb(AUTOSAVE_IPYNB)
         return self.list_cells()
 
 
-state_db = PersistentStateDB(DB_PATH)
-
-
 # ==============================================================================
-# 6. HARDWARE TELEMETRY MONITOR (DUAL GPU T4x2, CPU, RAM, DISK)
+# 6. HARDWARE TELEMETRY MONITOR (DUAL GPU T4x2 / A100 / H100, CPU, RAM, DISK)
 # ==============================================================================
 class HardwareMonitor:
     def __init__(self):
@@ -724,7 +774,7 @@ class HardwareMonitor:
             "kernel_state": kernel_state,
             "uptime_sec": int(time.time() - BOOT_TIME),
             "cpu_percent": round(psutil.cpu_percent(interval=None), 1),
-            "cpu_Count": psutil.cpu_count(logical=True),
+            "cpu_count": psutil.cpu_count(logical=True),
             "ram_used_gb": round(vm.used / (1024**3), 2),
             "ram_total_gb": round(vm.total / (1024**3), 2),
             "ram_percent": round(vm.percent, 1),
@@ -735,9 +785,6 @@ class HardwareMonitor:
             "gpus": self.get_gpu_stats(),
             "timestamp": time.time(),
         }
-
-
-hw_monitor = HardwareMonitor()
 
 
 # ==============================================================================
@@ -785,7 +832,6 @@ class KernelOrchestrator:
         self._stop_event = threading.Event()
         self.ws_broadcast_callback = None
 
-        # High-speed in-memory output cache + monotonic revision counter
         self._rev_counter = 1
         self.cell_outputs_cache: Dict[str, List[Dict[str, Any]]] = {}
         self.pending_clear: Dict[str, bool] = {}
@@ -803,6 +849,7 @@ class KernelOrchestrator:
     def _next_rev(self) -> int:
         with self._lock:
             self._rev_counter += 1
+            self.db.bump_rev()
             return self._rev_counter
 
     def _start_kernel_process(self):
@@ -824,15 +871,23 @@ class KernelOrchestrator:
                 py_path = env.get("PYTHONPATH", "")
                 env["PYTHONPATH"] = f"{WORKSPACE_DIR}:{BASE_ROOT}:{py_path}" if py_path else f"{WORKSPACE_DIR}:{BASE_ROOT}"
                 env["PYTHONUNBUFFERED"] = "1"
+                env["PIP_ROOT_USER_ACTION"] = "ignore"
+                env["PIP_DISABLE_PIP_VERSION_CHECK"] = "1"
 
                 self.km = jupyter_client.KernelManager(kernel_name="python3")
-                self.km.start_kernel(cwd=str(WORKSPACE_DIR), env=env)
+                self.km.start_kernel(
+                    cwd=str(WORKSPACE_DIR),
+                    env=env,
+                    extra_arguments=["--IPKernelApp.log_level=ERROR"],
+                )
                 self.kc = self.km.client()
                 self.kc.start_channels()
-                self.kc.wait_for_ready(timeout=30)
+                self.kc.wait_for_ready(timeout=35)
 
                 init_code = (
-                    "import os, sys\n"
+                    "import os, sys, subprocess\n"
+                    "os.environ['PIP_ROOT_USER_ACTION'] = 'ignore'\n"
+                    "os.environ['PIP_DISABLE_PIP_VERSION_CHECK'] = '1'\n"
                     f"if {repr(str(WORKSPACE_DIR))} not in sys.path: sys.path.insert(0, {repr(str(WORKSPACE_DIR))})\n"
                     f"if {repr(str(BASE_ROOT))} not in sys.path: sys.path.insert(0, {repr(str(BASE_ROOT))})\n"
                     "try:\n"
@@ -856,6 +911,15 @@ class KernelOrchestrator:
             except Exception:
                 pass
 
+    def get_live_cells(self) -> List[Dict[str, Any]]:
+        cells = self.db.list_cells()
+        with self._lock:
+            for c in cells:
+                cid = c["id"]
+                if cid in self.cell_outputs_cache:
+                    c["outputs"] = list(self.cell_outputs_cache[cid])
+        return cells
+
     def _sync_cell_state(self, cell_id: str, force: bool = False):
         now = time.time()
         with self._lock:
@@ -863,7 +927,7 @@ class KernelOrchestrator:
             if outputs is None:
                 c = self.db.get_cell(cell_id)
                 if c:
-                    self._emit_ws({"type": "cell_updated", "cell": c})
+                    self._emit_ws({"type": "cell_updated", "cell": c, "rev": self.db.global_rev})
                 return
             outputs_snapshot = [dict(o) for o in outputs]
 
@@ -876,14 +940,15 @@ class KernelOrchestrator:
             cell = self.db.update_cell(cell_id, outputs=outputs_snapshot)
             if cell:
                 self._last_ws_push[cell_id] = now
-                self._emit_ws({"type": "cell_updated", "cell": cell})
+                self._emit_ws({"type": "cell_updated", "cell": cell, "rev": self.db.global_rev})
         elif now - last_ws >= 0.20:
             self._last_ws_push[cell_id] = now
             self._dirty_cells.add(cell_id)
             cell = self.db.get_cell(cell_id)
             if cell:
                 cell["outputs"] = outputs_snapshot
-                self._emit_ws({"type": "cell_updated", "cell": cell})
+                self.db.bump_rev()
+                self._emit_ws({"type": "cell_updated", "cell": cell, "rev": self.db.global_rev})
         else:
             self._dirty_cells.add(cell_id)
 
@@ -907,11 +972,11 @@ class KernelOrchestrator:
         if active_id:
             c = self.db.update_cell(active_id, status="error", finished_at=time.time())
             if c:
-                self._emit_ws({"type": "cell_updated", "cell": c})
+                self._emit_ws({"type": "cell_updated", "cell": c, "rev": self.db.global_rev})
         for qid in queued_ids:
             c = self.db.update_cell(qid, status="idle")
             if c:
-                self._emit_ws({"type": "cell_updated", "cell": c})
+                self._emit_ws({"type": "cell_updated", "cell": c, "rev": self.db.global_rev})
 
         self._start_kernel_process()
         self._emit_ws({"type": "kernel_state", "state": self.kernel_state})
@@ -924,7 +989,7 @@ class KernelOrchestrator:
         for qid in queued_ids:
             c = self.db.update_cell(qid, status="idle")
             if c:
-                self._emit_ws({"type": "cell_updated", "cell": c})
+                self._emit_ws({"type": "cell_updated", "cell": c, "rev": self.db.global_rev})
         if self.km and self.km.is_alive():
             try:
                 self.km.interrupt_kernel()
@@ -941,7 +1006,7 @@ class KernelOrchestrator:
             if cell_id not in self.exec_queue and cell_id != self.active_cell_id:
                 self.exec_queue.append(cell_id)
                 cell = self.db.update_cell(cell_id, status="queued")
-                self._emit_ws({"type": "cell_updated", "cell": cell})
+                self._emit_ws({"type": "cell_updated", "cell": cell, "rev": self.db.global_rev})
         return cell
 
     def enqueue_all(self) -> List[Dict[str, Any]]:
@@ -949,11 +1014,11 @@ class KernelOrchestrator:
         for c in cells:
             if c["cell_type"] == "code" and c["source"].strip():
                 self.enqueue_cell(c["id"])
-        return self.db.list_cells()
+        return self.get_live_cells()
 
     def _execution_worker_loop(self):
         while not self._stop_event.is_set():
-            if time.time() - getattr(self, "_last_periodic_flush", 0.0) >= 0.4:
+            if time.time() - getattr(self, "_last_periodic_flush", 0.0) >= 0.35:
                 self._last_periodic_flush = time.time()
                 if self._dirty_cells:
                     for cid in list(self._dirty_cells):
@@ -1002,7 +1067,7 @@ class KernelOrchestrator:
             )
             self.kernel_state = "busy"
             self._emit_ws({"type": "kernel_state", "state": "busy"})
-            self._emit_ws({"type": "cell_updated", "cell": updated})
+            self._emit_ws({"type": "cell_updated", "cell": updated, "rev": self.db.global_rev})
 
             try:
                 msg_id = self.kc.execute(
@@ -1022,14 +1087,14 @@ class KernelOrchestrator:
                             {
                                 "output_type": "error",
                                 "ename": "KernelDiedError",
-                                "evalue": "Kernel process terminated unexpectedly (check OOM / memory).",
+                                "evalue": "Kernel process terminated unexpectedly (check GPU/RAM OOM).",
                                 "traceback": ["Kernel process terminated unexpectedly."],
                                 "_rev": self._next_rev(),
                             },
                         )
                         self._sync_cell_state(next_cid, force=True)
                         c = self.db.update_cell(next_cid, status="error", finished_at=time.time())
-                        self._emit_ws({"type": "cell_updated", "cell": c})
+                        self._emit_ws({"type": "cell_updated", "cell": c, "rev": self.db.global_rev})
                         with self._lock:
                             self.active_cell_id = None
                         self._start_kernel_process()
@@ -1040,7 +1105,6 @@ class KernelOrchestrator:
                             if time.time() - self._last_ws_push.get(d_cid, 0.0) >= 0.25:
                                 self._sync_cell_state(d_cid, force=False)
 
-                    # Drain shell channel replies so ZMQ sockets never fill up
                     try:
                         self.kc.get_shell_msg(timeout=0.05)
                     except queue.Empty:
@@ -1065,7 +1129,7 @@ class KernelOrchestrator:
                 )
                 self._sync_cell_state(next_cid, force=True)
                 c = self.db.update_cell(next_cid, status="error", finished_at=time.time())
-                self._emit_ws({"type": "cell_updated", "cell": c})
+                self._emit_ws({"type": "cell_updated", "cell": c, "rev": self.db.global_rev})
                 with self._lock:
                     self.active_cell_id = None
 
@@ -1090,7 +1154,6 @@ class KernelOrchestrator:
 
             if display_id:
                 new_out["display_id"] = display_id
-                # If this cell already has an output with the same display_id, update in place
                 for idx, existing in enumerate(outputs):
                     if existing.get("display_id") == display_id:
                         outputs[idx] = new_out
@@ -1114,12 +1177,17 @@ class KernelOrchestrator:
             else:
                 outputs.append(new_out)
 
-    def _update_display_by_id(self, fallback_cell_id: Optional[str], display_id: str, data: Dict[str, Any], metadata: Dict[str, Any]):
+    def _update_display_by_id(
+        self,
+        fallback_cell_id: Optional[str],
+        display_id: str,
+        data: Dict[str, Any],
+        metadata: Dict[str, Any],
+    ):
         rev = self._next_rev()
         updated_cells = set()
 
         with self._lock:
-            # Scan active cache first for matching display_id
             for cid, outs in self.cell_outputs_cache.items():
                 for idx, out in enumerate(outs):
                     if out.get("display_id") == display_id:
@@ -1128,7 +1196,6 @@ class KernelOrchestrator:
                         outs[idx]["_rev"] = rev
                         updated_cells.add(cid)
 
-            # If not found in existing outputs, append to fallback_cell_id
             if not updated_cells and fallback_cell_id:
                 self._append_output(
                     fallback_cell_id,
@@ -1178,7 +1245,7 @@ class KernelOrchestrator:
                             has_err = any(o.get("output_type") == "error" for o in cell.get("outputs", []))
                             final_status = "error" if has_err else "success"
                             updated = self.db.update_cell(cell_id, status=final_status, finished_at=time.time())
-                            self._emit_ws({"type": "cell_updated", "cell": updated})
+                            self._emit_ws({"type": "cell_updated", "cell": updated, "rev": self.db.global_rev})
                         with self._lock:
                             self.msg_to_cell.pop(parent_id, None)
                             if self.active_cell_id == cell_id:
@@ -1256,13 +1323,98 @@ class KernelOrchestrator:
                 self._sync_cell_state(cell_id, force=True)
 
 
-kernel_orchestrator = KernelOrchestrator(state_db)
+# ==============================================================================
+# 9. AUTOMATIC CLOUDFLARE TUNNEL WITH WATCHDOG
+# ==============================================================================
+class CloudflareTunnelManager:
+    def __init__(self, local_port: int):
+        self.local_port = local_port
+        self.proc: Optional[subprocess.Popen] = None
+        self.public_url: Optional[str] = None
+        self._stop = False
+        self._lock = threading.Lock()
+
+    def ensure_binary(self) -> str:
+        bin_path = APP_DIR / "cloudflared"
+        if shutil.which("cloudflared"):
+            return shutil.which("cloudflared")
+        if bin_path.exists() and os.access(str(bin_path), os.X_OK):
+            return str(bin_path)
+
+        machine = platform.machine().lower()
+        arch = "arm64" if ("aarch64" in machine or "arm64" in machine) else "amd64"
+        url = f"https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-{arch}"
+        logger.info(f"Downloading cloudflared binary from {url} ...")
+        urllib.request.urlretrieve(url, str(bin_path))
+        os.chmod(str(bin_path), 0o755)
+        return str(bin_path)
+
+    def start(self, timeout: int = 35) -> Optional[str]:
+        try:
+            cf_bin = self.ensure_binary()
+        except Exception as e:
+            logger.error(f"Could not install cloudflared: {e}")
+            return None
+
+        import re
+        url_pattern = re.compile(r"https://[a-zA-Z0-9\-]+\.trycloudflare\.com")
+
+        with self._lock:
+            if self.proc and self.proc.poll() is None and self.public_url:
+                return self.public_url
+
+            cmd = [cf_bin, "tunnel", "--url", f"http://127.0.0.1:{self.local_port}", "--no-autoupdate"]
+            self.proc = subprocess.Popen(
+                cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                stdin=subprocess.DEVNULL,
+                text=True,
+                bufsize=1,
+                start_new_session=True,
+            )
+
+        found_url = None
+        start_t = time.time()
+
+        def _reader(p: subprocess.Popen):
+            nonlocal found_url
+            for line in iter(p.stdout.readline, ""):
+                m = url_pattern.search(line)
+                if m and not found_url:
+                    found_url = m.group(0)
+                    self.public_url = found_url
+                    TUNNEL_URL_FILE.write_text(found_url, encoding="utf-8")
+                    logger.info(f"Cloudflare Tunnel active: {found_url}")
+
+        threading.Thread(target=_reader, args=(self.proc,), daemon=True).start()
+
+        while time.time() - start_t < timeout:
+            if found_url:
+                break
+            time.sleep(0.25)
+
+        threading.Thread(target=self._watchdog_loop, daemon=True).start()
+        return self.public_url
+
+    def _watchdog_loop(self):
+        while not self._stop:
+            time.sleep(10.0)
+            if self._stop:
+                break
+            if self.proc and self.proc.poll() is not None:
+                logger.warning("Cloudflare tunnel process exited; auto-restarting tunnel...")
+                self.public_url = None
+                self.start(timeout=25)
 
 
 # ==============================================================================
-# 9. FASTAPI APPLICATION, AUTHENTICATION & WEBSOCKET HUB
+# 10. FASTAPI APPLICATION, LIFESPAN, AUTH & HYBRID SYNC HUB
 # ==============================================================================
-app = FastAPI(title="Ultimate Cloud Notebook v4.0", docs_url=None, redoc_url=None)
+state_db: Optional[PersistentStateDB] = None
+hw_monitor: Optional[HardwareMonitor] = None
+kernel_orchestrator: Optional[KernelOrchestrator] = None
+tunnel_manager: Optional[CloudflareTunnelManager] = None
 
 
 class WebSocketHub:
@@ -1294,21 +1446,34 @@ class WebSocketHub:
 
 
 ws_hub = WebSocketHub()
-kernel_orchestrator.ws_broadcast_callback = ws_hub.broadcast_threadsafe
-
-
-@app.on_event("startup")
-async def on_startup():
-    ws_hub.loop = asyncio.get_running_loop()
-    asyncio.create_task(telemetry_push_loop())
 
 
 async def telemetry_push_loop():
     while True:
         await asyncio.sleep(2.0)
-        if ws_hub.clients:
+        if ws_hub.clients and hw_monitor and kernel_orchestrator:
             stats = hw_monitor.collect(kernel_orchestrator.kernel_state)
             await ws_hub.broadcast_async({"type": "telemetry", "telemetry": stats})
+
+
+@asynccontextmanager
+async def app_lifespan(app_instance: FastAPI):
+    global state_db, hw_monitor, kernel_orchestrator, tunnel_manager
+    state_db = PersistentStateDB(DB_PATH)
+    hw_monitor = HardwareMonitor()
+    kernel_orchestrator = KernelOrchestrator(state_db)
+    kernel_orchestrator.ws_broadcast_callback = ws_hub.broadcast_threadsafe
+    tunnel_manager = CloudflareTunnelManager(SERVER_PORT)
+    threading.Thread(target=tunnel_manager.start, daemon=True).start()
+
+    ws_hub.loop = asyncio.get_running_loop()
+    telemetry_task = asyncio.create_task(telemetry_push_loop())
+    yield
+    telemetry_task.cancel()
+
+
+app = FastAPI(title="Ultimate Cloud Notebook v4.5", docs_url=None, redoc_url=None, lifespan=app_lifespan)
+app.add_middleware(GZipMiddleware, minimum_size=1000)
 
 
 def verify_token_str(candidate: Optional[str]) -> bool:
@@ -1345,20 +1510,48 @@ class ConfigSaveReq(BaseModel):
     config: Dict[str, Any]
 
 
+@app.get("/api/health")
+async def api_health():
+    t_url = tunnel_manager.public_url if tunnel_manager else None
+    if not t_url and TUNNEL_URL_FILE.exists():
+        t_url = TUNNEL_URL_FILE.read_text(encoding="utf-8").strip()
+    return {
+        "status": "ok",
+        "pid": os.getpid(),
+        "kernel_state": kernel_orchestrator.kernel_state if kernel_orchestrator else "starting",
+        "tunnel_url": t_url,
+    }
+
+
 @app.get("/api/state", dependencies=[Depends(require_auth)])
 async def api_get_state():
     return {
-        "cells": state_db.list_cells(),
+        "rev": state_db.global_rev,
+        "cells": kernel_orchestrator.get_live_cells(),
         "telemetry": hw_monitor.collect(kernel_orchestrator.kernel_state),
         "workspace_dir": str(WORKSPACE_DIR),
         "is_kaggle": IS_KAGGLE,
     }
 
 
+@app.get("/api/poll", dependencies=[Depends(require_auth)])
+async def api_poll_delta(since_rev: int = 0):
+    cur_rev = state_db.global_rev
+    telemetry = hw_monitor.collect(kernel_orchestrator.kernel_state)
+    if since_rev == cur_rev:
+        return {"changed": False, "rev": cur_rev, "telemetry": telemetry}
+    return {
+        "changed": True,
+        "rev": cur_rev,
+        "cells": kernel_orchestrator.get_live_cells(),
+        "telemetry": telemetry,
+    }
+
+
 @app.post("/api/cells", dependencies=[Depends(require_auth)])
 async def api_create_cell(req: CellCreateReq):
     cell = state_db.create_cell(cell_type=req.cell_type, source=req.source, after_id=req.after_id)
-    await ws_hub.broadcast_async({"type": "cells_list", "cells": state_db.list_cells()})
+    await ws_hub.broadcast_async({"type": "cells_list", "cells": kernel_orchestrator.get_live_cells(), "rev": state_db.global_rev})
     return cell
 
 
@@ -1373,22 +1566,25 @@ async def api_update_cell(cid: str, req: CellUpdateReq):
     if not cell:
         raise HTTPException(status_code=404, detail="Cell not found")
     state_db.export_to_ipynb(AUTOSAVE_IPYNB)
-    await ws_hub.broadcast_async({"type": "cell_updated", "cell": cell})
+    await ws_hub.broadcast_async({"type": "cell_updated", "cell": cell, "rev": state_db.global_rev})
     return cell
 
 
 @app.delete("/api/cells/{cid}", dependencies=[Depends(require_auth)])
 async def api_delete_cell(cid: str):
+    with kernel_orchestrator._lock:
+        kernel_orchestrator.cell_outputs_cache.pop(cid, None)
     state_db.delete_cell(cid)
-    cells = state_db.list_cells()
-    await ws_hub.broadcast_async({"type": "cells_list", "cells": cells})
+    cells = kernel_orchestrator.get_live_cells()
+    await ws_hub.broadcast_async({"type": "cells_list", "cells": cells, "rev": state_db.global_rev})
     return {"cells": cells}
 
 
 @app.post("/api/cells/{cid}/move", dependencies=[Depends(require_auth)])
 async def api_move_cell(cid: str, req: CellMoveReq):
-    cells = state_db.move_cell(cid, req.direction)
-    await ws_hub.broadcast_async({"type": "cells_list", "cells": cells})
+    state_db.move_cell(cid, req.direction)
+    cells = kernel_orchestrator.get_live_cells()
+    await ws_hub.broadcast_async({"type": "cells_list", "cells": cells, "rev": state_db.global_rev})
     return {"cells": cells}
 
 
@@ -1397,7 +1593,7 @@ async def api_clear_cell_output(cid: str):
     with kernel_orchestrator._lock:
         kernel_orchestrator.cell_outputs_cache[cid] = []
     cell = state_db.update_cell(cid, outputs=[], status="idle")
-    await ws_hub.broadcast_async({"type": "cell_updated", "cell": cell})
+    await ws_hub.broadcast_async({"type": "cell_updated", "cell": cell, "rev": state_db.global_rev})
     return cell
 
 
@@ -1414,7 +1610,7 @@ async def api_run_cell(cid: str, req: Optional[CellUpdateReq] = None):
 @app.post("/api/kernel/run-all", dependencies=[Depends(require_auth)])
 async def api_run_all():
     cells = kernel_orchestrator.enqueue_all()
-    await ws_hub.broadcast_async({"type": "cells_list", "cells": cells})
+    await ws_hub.broadcast_async({"type": "cells_list", "cells": cells, "rev": state_db.global_rev})
     return {"cells": cells}
 
 
@@ -1434,8 +1630,9 @@ async def api_restart_kernel():
 async def api_clear_all_outputs():
     with kernel_orchestrator._lock:
         kernel_orchestrator.cell_outputs_cache.clear()
-    cells = state_db.clear_all_outputs()
-    await ws_hub.broadcast_async({"type": "cells_list", "cells": cells})
+    state_db.clear_all_outputs()
+    cells = kernel_orchestrator.get_live_cells()
+    await ws_hub.broadcast_async({"type": "cells_list", "cells": cells, "rev": state_db.global_rev})
     return {"cells": cells}
 
 
@@ -1452,8 +1649,10 @@ async def api_export_ipynb():
 @app.post("/api/notebook/import", dependencies=[Depends(require_auth)])
 async def api_import_ipynb(file: UploadFile = File(...)):
     raw = await file.read()
+    with kernel_orchestrator._lock:
+        kernel_orchestrator.cell_outputs_cache.clear()
     cells = state_db.import_from_ipynb(raw.decode("utf-8", errors="replace"))
-    await ws_hub.broadcast_async({"type": "cells_list", "cells": cells})
+    await ws_hub.broadcast_async({"type": "cells_list", "cells": cells, "rev": state_db.global_rev})
     return {"cells": cells}
 
 
@@ -1587,7 +1786,8 @@ async def websocket_endpoint(ws: WebSocket):
         await ws.send_json(
             {
                 "type": "init",
-                "cells": state_db.list_cells(),
+                "rev": state_db.global_rev,
+                "cells": kernel_orchestrator.get_live_cells(),
                 "telemetry": hw_monitor.collect(kernel_orchestrator.kernel_state),
             }
         )
@@ -1595,7 +1795,7 @@ async def websocket_endpoint(ws: WebSocket):
             msg = await ws.receive_json()
             action = msg.get("action")
             if action == "ping":
-                await ws.send_json({"type": "pong"})
+                await ws.send_json({"type": "pong", "rev": state_db.global_rev})
             elif action == "save_source":
                 cid = msg.get("cell_id")
                 src = msg.get("source")
@@ -1608,14 +1808,14 @@ async def websocket_endpoint(ws: WebSocket):
 
 
 # ==============================================================================
-# 10. MODERN CLOUD NOTEBOOK FRONTEND (INCREMENTAL DOM & DISPLAY_ID ENGINE)
+# 11. MODERN CLOUD NOTEBOOK FRONTEND (HYBRID WS + HTTP DELTA POLLING)
 # ==============================================================================
 FRONTEND_HTML = r"""<!DOCTYPE html>
 <html lang="en" class="dark">
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>Ultimate Cloud Notebook v4.0 — Pro AI & Audio Studio</title>
+<title>Ultimate Cloud Notebook v4.5 — Pro AI & Audio Studio</title>
 <script src="https://cdn.tailwindcss.com"></script>
 <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/styles/tokyo-night-dark.min.css">
 <script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/highlight.min.js"></script>
@@ -1644,8 +1844,7 @@ FRONTEND_HTML = r"""<!DOCTYPE html>
   .cell-card.running { border-color: #38bdf8 !important; box-shadow: 0 0 15px rgba(56, 189, 248, 0.15); }
   .cell-card.error { border-color: #f43f5e !important; }
   .cell-card.success { border-color: #10b981 !important; }
-  .output-area { max-height: 780px; overflow-y: auto; background: #060911; border-top: 1px solid #1e293b; }
-  .ansi-err { color: #fb7185; }
+  .output-area { max-height: 820px; overflow-y: auto; background: #060911; border-top: 1px solid #1e293b; }
   .markdown-body h1, .markdown-body h2, .markdown-body h3 { font-weight: 700; color: #f8fafc; margin: 0.4em 0; }
   .markdown-body h3 { font-size: 1.1rem; }
   .markdown-body ul { list-style: disc; padding-left: 1.4rem; margin: 0.4em 0; }
@@ -1662,7 +1861,7 @@ FRONTEND_HTML = r"""<!DOCTYPE html>
     <div class="flex items-center gap-2">
       <span class="w-3 h-3 rounded-full bg-sky-400 shadow-[0_0_10px_#38bdf8]"></span>
       <span class="font-bold text-sm tracking-wide text-white">ULTIMATE CLOUD NOTEBOOK</span>
-      <span id="env-badge" class="text-[11px] font-mono px-2 py-0.5 rounded bg-sky-500/10 text-sky-400 border border-sky-500/30">v4.0 PRO</span>
+      <span id="env-badge" class="text-[11px] font-mono px-2 py-0.5 rounded bg-sky-500/10 text-sky-400 border border-sky-500/30">v4.5 DAEMON</span>
     </div>
     <div class="h-4 w-[1px] bg-slate-800 hidden sm:block"></div>
     <div class="flex items-center gap-2 text-xs font-mono">
@@ -1674,7 +1873,7 @@ FRONTEND_HTML = r"""<!DOCTYPE html>
     </div>
   </div>
 
-  <!-- REAL-TIME HARDWARE METRICS (CPU, RAM, DISK, DUAL GPU) -->
+  <!-- REAL-TIME HARDWARE METRICS -->
   <div class="flex items-center gap-3 text-xs font-mono flex-wrap">
     <div class="bg-slate-950 border border-slate-800 px-2.5 py-1 rounded flex items-center gap-2">
       <span class="text-slate-400">CPU</span>
@@ -1732,7 +1931,7 @@ FRONTEND_HTML = r"""<!DOCTYPE html>
     <div id="cells-container" class="max-w-5xl mx-auto space-y-5 pb-24"></div>
   </main>
 
-  <!-- RIGHT STUDIO SIDEBAR: AUDIO PLAYER, CHECKPOINTS & LOGS -->
+  <!-- RIGHT STUDIO SIDEBAR -->
   <aside id="studio-sidebar" class="w-96 bg-slate-900/90 border-l border-slate-800 flex flex-col overflow-hidden">
     <div class="flex border-b border-slate-800 text-xs font-semibold">
       <button onclick="switchTab('audio')" id="tab-btn-audio" class="flex-1 py-2.5 text-sky-400 border-b-2 border-sky-400 bg-slate-950/40">🔊 Audio & Files</button>
@@ -1740,7 +1939,6 @@ FRONTEND_HTML = r"""<!DOCTYPE html>
       <button onclick="switchTab('logs')" id="tab-btn-logs" class="flex-1 py-2.5 text-slate-400 hover:text-slate-200">📜 Logs</button>
     </div>
 
-    <!-- TAB 1: AUDIO STUDIO & CHECKPOINTS -->
     <div id="tab-audio" class="flex-1 overflow-y-auto p-3.5 space-y-4 text-xs">
       <div class="flex items-center justify-between">
         <span class="font-bold text-slate-200 uppercase tracking-wider">Workspace Audio Studio</span>
@@ -1759,7 +1957,6 @@ FRONTEND_HTML = r"""<!DOCTYPE html>
       </div>
     </div>
 
-    <!-- TAB 2: PERSISTENT TRAINING CONFIG -->
     <div id="tab-config" class="hidden flex-1 overflow-y-auto p-3.5 space-y-3 text-xs">
       <div class="text-slate-400 leading-relaxed">
         Saved to <code class="text-sky-400">workspace/training_config.json</code>. Access in cells via <code class="text-emerald-400">ucloud.load_training_config()</code>.
@@ -1768,7 +1965,6 @@ FRONTEND_HTML = r"""<!DOCTYPE html>
       <button onclick="saveTrainingConfig()" class="w-full py-2 rounded bg-sky-600 hover:bg-sky-500 text-white font-semibold transition">💾 Save Training Config</button>
     </div>
 
-    <!-- TAB 3: SYSTEM LOGS -->
     <div id="tab-logs" class="hidden flex-1 overflow-y-auto p-3.5 flex flex-col gap-2 text-xs">
       <div class="flex justify-between items-center">
         <span class="font-bold text-slate-300">Backend & Kernel Log</span>
@@ -1780,14 +1976,17 @@ FRONTEND_HTML = r"""<!DOCTYPE html>
 </div>
 
 <script>
+const INJECTED_TOKEN = "__UCN_INJECTED_TOKEN__";
 const urlParams = new URLSearchParams(window.location.search);
-const AUTH_TOKEN = urlParams.get('token') || '';
+const AUTH_TOKEN = urlParams.get('token') || INJECTED_TOKEN || '';
 let cellsState = [];
 let cellMap = {};
 let outputSignatures = {};
 let activeTimers = {};
 let ws = null;
 let saveDebounceTimers = {};
+let lastSeenRev = 0;
+let pollInFlight = false;
 
 function apiHeaders(extra = {}) {
   return Object.assign({ 'X-Auth-Token': AUTH_TOKEN }, extra);
@@ -1814,6 +2013,7 @@ function connectWebSocket() {
   ws.onmessage = (ev) => {
     try {
       const msg = JSON.parse(ev.data);
+      if (msg.rev && msg.rev > lastSeenRev) lastSeenRev = msg.rev;
       if (msg.type === 'init') {
         updateTelemetryUI(msg.telemetry);
         reconcileCellsList(msg.cells);
@@ -1830,10 +2030,28 @@ function connectWebSocket() {
   };
 
   ws.onclose = () => {
-    document.getElementById('ws-dot').className = 'w-2 h-2 rounded-full bg-rose-500 animate-ping';
-    document.getElementById('ws-status').textContent = 'Reconnecting...';
-    setTimeout(connectWebSocket, 2000);
+    document.getElementById('ws-dot').className = 'w-2 h-2 rounded-full bg-amber-400 animate-pulse';
+    document.getElementById('ws-status').textContent = 'HTTP Sync Active';
+    setTimeout(connectWebSocket, 2500);
   };
+}
+
+// Hybrid HTTP Delta Polling Fallback: Guarantees large outputs (base64 WAV + PNG)
+// always arrive even if Cloudflare Quick Tunnel drops a large WebSocket frame.
+async function pollDeltaState() {
+  if (pollInFlight) return;
+  pollInFlight = true;
+  try {
+    const data = await apiFetch(`/api/poll?since_rev=${lastSeenRev}`);
+    if (data.telemetry) updateTelemetryUI(data.telemetry);
+    if (data.changed && data.cells) {
+      lastSeenRev = data.rev || lastSeenRev;
+      reconcileCellsList(data.cells);
+    }
+  } catch (e) {
+  } finally {
+    pollInFlight = false;
+  }
 }
 
 function updateKernelBadge(state) {
@@ -1920,7 +2138,6 @@ function createOutputItemDOM(out) {
       const htmlBox = document.createElement('div');
       htmlBox.className = 'py-1 overflow-x-auto text-slate-100 font-sans';
       htmlBox.innerHTML = Array.isArray(d['text/html']) ? d['text/html'].join('') : d['text/html'];
-      // Execute inline scripts if any
       htmlBox.querySelectorAll('script').forEach(oldScript => {
         const newScript = document.createElement('script');
         Array.from(oldScript.attributes).forEach(attr => newScript.setAttribute(attr.name, attr.value));
@@ -2013,7 +2230,6 @@ function syncCellOutputsDOM(cell) {
       if (out.output_type === 'stream' && existingNode.firstChild && existingNode.firstChild.tagName === 'PRE') {
         existingNode.firstChild.textContent = out.text || '';
       } else {
-        // Avoid interrupting an actively playing <audio> element if user is listening to it
         const playingAudio = existingNode.querySelector('audio');
         if (playingAudio && !playingAudio.paused && playingAudio.currentTime > 0) {
           continue;
@@ -2444,6 +2660,7 @@ async function loadLogs() {
 
 window.addEventListener('DOMContentLoaded', () => {
   connectWebSocket();
+  setInterval(pollDeltaState, 1800);
   refreshFiles();
   setInterval(refreshFiles, 12000);
 });
@@ -2472,113 +2689,98 @@ async def serve_ui(request: Request):
             """,
             status_code=401,
         )
-    resp = HTMLResponse(content=FRONTEND_HTML)
+    rendered_html = FRONTEND_HTML.replace("__UCN_INJECTED_TOKEN__", AUTH_TOKEN)
+    resp = HTMLResponse(content=rendered_html)
     resp.set_cookie(key="ucn_token", value=AUTH_TOKEN, httponly=True, samesite="lax")
     return resp
 
 
 # ==============================================================================
-# 11. AUTOMATIC CLOUDFLARE TUNNEL (TRYCLOUDFLARE.COM) MANAGER
+# 12. 24/7 VPS DAEMON & NOTEBOOK LAUNCHER
 # ==============================================================================
-def ensure_cloudflared_binary() -> str:
-    bin_path = APP_DIR / "cloudflared"
-    if shutil.which("cloudflared"):
-        return shutil.which("cloudflared")
-    if bin_path.exists() and os.access(str(bin_path), os.X_OK):
-        return str(bin_path)
-
-    machine = platform.machine().lower()
-    arch = "arm64" if ("aarch64" in machine or "arm64" in machine) else "amd64"
-    url = f"https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-{arch}"
-    logger.info(f"Downloading cloudflared binary from {url} ...")
-    urllib.request.urlretrieve(url, str(bin_path))
-    os.chmod(str(bin_path), 0o755)
-    return str(bin_path)
-
-
-def start_cloudflare_tunnel(local_port: int, timeout: int = 35) -> Optional[str]:
+def _check_server_health(port: int) -> Optional[Dict[str, Any]]:
     try:
-        cf_bin = ensure_cloudflared_binary()
-    except Exception as e:
-        logger.error(f"Could not install cloudflared: {e}")
+        req = urllib.request.Request(f"http://127.0.0.1:{port}/api/health")
+        with urllib.request.urlopen(req, timeout=2.0) as resp:
+            if resp.status == 200:
+                return json.loads(resp.read().decode("utf-8"))
+    except Exception:
         return None
-
-    import re
-    cmd = [cf_bin, "tunnel", "--url", f"http://127.0.0.1:{local_port}", "--no-autoupdate"]
-    proc = subprocess.Popen(
-        cmd,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,
-        text=True,
-        bufsize=1,
-    )
-
-    url_pattern = re.compile(r"https://[a-zA-Z0-9\-]+\.trycloudflare\.com")
-    found_url = None
-    start_t = time.time()
-
-    def _reader():
-        nonlocal found_url
-        for line in iter(proc.stdout.readline, ""):
-            m = url_pattern.search(line)
-            if m and not found_url:
-                found_url = m.group(0)
-
-    t = threading.Thread(target=_reader, daemon=True)
-    t.start()
-
-    while time.time() - start_t < timeout:
-        if found_url:
-            TUNNEL_URL_FILE.write_text(found_url, encoding="utf-8")
-            return found_url
-        time.sleep(0.25)
     return None
 
 
-# ==============================================================================
-# 12. NON-BLOCKING KAGGLE / COLAB / CLI LAUNCHER
-# ==============================================================================
-def _is_port_in_use(port: int) -> bool:
-    import socket
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-        return s.connect_ex(("127.0.0.1", port)) == 0
+def _stop_existing_daemon():
+    health = _check_server_health(SERVER_PORT)
+    pids_to_kill = set()
+    if health and health.get("pid"):
+        pids_to_kill.add(int(health["pid"]))
+    if DAEMON_PID_FILE.exists():
+        try:
+            pids_to_kill.add(int(DAEMON_PID_FILE.read_text(encoding="utf-8").strip()))
+        except Exception:
+            pass
+    for pid in pids_to_kill:
+        if pid == os.getpid():
+            continue
+        try:
+            os.kill(pid, signal.SIGTERM)
+        except Exception:
+            pass
+    try:
+        subprocess.run(["pkill", "-f", f"cloudflared.*127.0.0.1:{SERVER_PORT}"], stderr=subprocess.DEVNULL)
+    except Exception:
+        pass
+    time.sleep(1.0)
 
 
-def launch_in_notebook_or_cli():
+def _run_server_foreground():
     import uvicorn
+    DAEMON_PID_FILE.write_text(str(os.getpid()), encoding="utf-8")
+    try:
+        signal.signal(signal.SIGHUP, signal.SIG_IGN)
+    except Exception:
+        pass
+    uvicorn.run(
+        app,
+        host=SERVER_HOST,
+        port=SERVER_PORT,
+        log_level="warning",
+        access_log=False,
+        ws_max_size=64 * 1024 * 1024,
+        ws_ping_interval=20.0,
+        ws_ping_timeout=30.0,
+    )
 
-    in_interactive_nb = "ipykernel" in sys.modules
 
-    if not _is_port_in_use(SERVER_PORT):
-        config = uvicorn.Config(app, host=SERVER_HOST, port=SERVER_PORT, log_level="warning", access_log=False)
-        server = uvicorn.Server(config)
-        srv_thread = threading.Thread(target=server.run, daemon=True)
-        srv_thread.start()
-        time.sleep(1.5)
-        public_base = start_cloudflare_tunnel(SERVER_PORT)
-    else:
-        logger.info(f"Server already running on port {SERVER_PORT}, reusing existing session.")
-        public_base = TUNNEL_URL_FILE.read_text(encoding="utf-8").strip() if TUNNEL_URL_FILE.exists() else None
-        if not public_base:
-            public_base = start_cloudflare_tunnel(SERVER_PORT)
+def _print_banner(health: Dict[str, Any], in_nb: bool):
+    t_url = health.get("tunnel_url")
+    if not t_url and TUNNEL_URL_FILE.exists():
+        t_url = TUNNEL_URL_FILE.read_text(encoding="utf-8").strip()
 
     local_url = f"http://127.0.0.1:{SERVER_PORT}/?token={AUTH_TOKEN}"
-    public_url = f"{public_base}/?token={AUTH_TOKEN}" if public_base else None
+    public_url = f"{t_url}/?token={AUTH_TOKEN}" if t_url else None
+    pid = health.get("pid", os.getpid())
+    script_name = Path(sys.argv[0]).name if sys.argv and sys.argv[0] else "sfsf.py"
 
     banner = [
-        "=" * 78,
-        "🚀 ULTIMATE CLOUD NOTEBOOK v4.0 IS LIVE AND RUNNING!",
-        "=" * 78,
+        "=" * 80,
+        "🚀 ULTIMATE CLOUD NOTEBOOK v4.5 IS LIVE (24/7 BACKGROUND DAEMON)!",
+        "=" * 80,
+        f"Daemon Status   : ONLINE (PID: {pid} | Kernel: {health.get('kernel_state', 'idle')})",
         f"Mode            : {'Kaggle Mode (/kaggle/working)' if IS_KAGGLE else 'Standalone VPS Mode'}",
         f"Workspace Path  : {WORKSPACE_DIR}",
         f"Autosave .ipynb : {AUTOSAVE_IPYNB}",
         f"Local URL       : {local_url}",
-        f"Cloudflare URL  : {public_url or 'Tunnel unavailable (use Local URL)'}",
-        "=" * 78,
+        f"Cloudflare URL  : {public_url or 'Generating tunnel URL...'}",
+        "=" * 80,
+        "✅ Server, Cloudflare Tunnel va IPython Kernel orqa fonda (daemon) ishlayapti.",
+        "✅ Terminalni (SSH) yopsangiz yoki Ctrl+C bossangiz ham runtime TO'XTAMAYDI!",
+        f"ℹ️  Boshqarish: Holat/URL: python {script_name} | Restart: python {script_name} --restart | Stop: python {script_name} --stop",
+        "=" * 80,
     ]
     print("\n".join(banner), flush=True)
 
-    if in_interactive_nb:
+    if in_nb:
         try:
             from IPython.display import display, HTML
             target_link = public_url or local_url
@@ -2587,7 +2789,7 @@ def launch_in_notebook_or_cli():
                     f"""
                     <div style="margin:14px 0;padding:18px 22px;background:#0f172a;border:2px solid #0284c7;border-radius:12px;color:#f8fafc;font-family:sans-serif;">
                         <div style="font-size:16px;font-weight:800;color:#38bdf8;margin-bottom:8px;">
-                            ⚡ ULTIMATE CLOUD NOTEBOOK v4.0 — PUBLIC CONTROL PANEL
+                            ⚡ ULTIMATE CLOUD NOTEBOOK v4.5 — PUBLIC CONTROL PANEL
                         </div>
                         <div style="font-size:13px;color:#cbd5e1;margin-bottom:14px;">
                             Brauzerni yopsangiz ham runtime va AI mashg'ulotlar to'xtamaydi. Quyidagi havola orqali istalgan vaqtda qayta kiring:
@@ -2606,12 +2808,82 @@ def launch_in_notebook_or_cli():
         except Exception:
             pass
 
-    # Keep cell alive so Kaggle/Colab session stays active while background threads run
-    try:
-        while True:
-            time.sleep(3600)
-    except KeyboardInterrupt:
-        print("\n[Ultimate Cloud Notebook] Launcher interrupted. Background server remains active in session.")
+
+def launch_in_notebook_or_cli():
+    args = sys.argv[1:]
+    if "--daemon" in args:
+        _run_server_foreground()
+        return
+
+    if "--stop" in args:
+        print("🛑 Stopping Ultimate Cloud Notebook daemon...", flush=True)
+        _stop_existing_daemon()
+        print("✅ Stopped.", flush=True)
+        return
+
+    if "--restart" in args:
+        print("🔄 Restarting Ultimate Cloud Notebook daemon...", flush=True)
+        _stop_existing_daemon()
+
+    in_nb = is_running_in_notebook()
+    health = _check_server_health(SERVER_PORT)
+
+    if not health:
+        if in_nb or "--fg" in args:
+            import uvicorn
+            config = uvicorn.Config(
+                app,
+                host=SERVER_HOST,
+                port=SERVER_PORT,
+                log_level="warning",
+                access_log=False,
+                ws_max_size=64 * 1024 * 1024,
+            )
+            server = uvicorn.Server(config)
+            threading.Thread(target=server.run, daemon=True).start()
+        else:
+            # Spawn detached 24/7 background daemon process on VPS CLI
+            script_path = os.path.abspath(__file__)
+            daemon_log_path = LOGS_DIR / "daemon.log"
+            daemon_log = open(daemon_log_path, "a", encoding="utf-8")
+            subprocess.Popen(
+                [sys.executable, "-u", script_path, "--daemon"],
+                stdout=daemon_log,
+                stderr=daemon_log,
+                stdin=subprocess.DEVNULL,
+                start_new_session=True,
+                cwd=str(BASE_ROOT),
+            )
+
+        print("⏳ Starting IPython Kernel & Cloudflare HTTPS Tunnel (please wait ~5-10s)...", flush=True)
+        start_wait = time.time()
+        while time.time() - start_wait < 45.0:
+            h = _check_server_health(SERVER_PORT)
+            if h:
+                health = h
+                if h.get("tunnel_url"):
+                    break
+            time.sleep(0.5)
+
+    if not health:
+        health = _check_server_health(SERVER_PORT) or {"pid": os.getpid(), "kernel_state": "starting", "tunnel_url": None}
+    elif not health.get("tunnel_url"):
+        # Wait up to 12 more seconds if server is up but tunnel URL is still registering
+        for _ in range(24):
+            h = _check_server_health(SERVER_PORT)
+            if h and h.get("tunnel_url"):
+                health = h
+                break
+            time.sleep(0.5)
+
+    _print_banner(health, in_nb)
+
+    if in_nb or "--fg" in args:
+        try:
+            while True:
+                time.sleep(3600)
+        except KeyboardInterrupt:
+            print("\n[Ultimate Cloud Notebook] Detached from console. Background daemon remains active.")
 
 
 if __name__ == "__main__":
